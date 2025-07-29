@@ -1,9 +1,10 @@
 terraform {
   cloud {
-    organization = "hyungwook-test-org"  # 실제 HCP Terraform organization 이름으로 변경 필요
+    organization = "hyungwook"
     
     workspaces {
       name = "cis-sentinel-test"
+      project = "amazon-q-terraform"
     }
   }
   
@@ -11,6 +12,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
     }
   }
 }
@@ -72,8 +77,9 @@ resource "aws_route_table_association" "public" {
 
 # CIS 정책 위반을 위한 보안 그룹 (SSH/RDP 포트 개방)
 resource "aws_security_group" "vulnerable_sg" {
-  name_description = "CIS test - vulnerable security group"
-  vpc_id          = aws_vpc.main.id
+  name        = "cis-test-vulnerable-sg"
+  description = "CIS test - vulnerable security group"
+  vpc_id      = aws_vpc.main.id
 
   # SSH 포트를 모든 IP에 개방 (CIS 위반)
   ingress {
