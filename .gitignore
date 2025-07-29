@@ -1,0 +1,31 @@
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+
+# Terraform directories
+.terraform/
+.terraform.lock.hcl
+
+# Plan files
+*.tfplan
+tfplan.binary
+tfplan.json
+
+# Backup files
+*.bak
+backup/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
