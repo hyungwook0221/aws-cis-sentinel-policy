@@ -1,146 +1,265 @@
+# AWS Well-Architected EKS Cluster Configuration
+
 terraform {
-  cloud {
-    organization = "hyungwook"
-    
-    workspaces {
-      name = "cis-sentinel-test"
-      project = "amazon-q-terraform"
-    }
-  }
-  
+  required_version = ">= 1.5.7"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = ">= 6.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.1"
+    tls = {
+      source  = "hashicorp/tls"
+      version = ">= 4.0"
     }
   }
 }
 
 provider "aws" {
-  region = var.aws_region
+  region = var.region
 }
 
-# VPC 생성
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
+# Data sources
+data "aws_caller_identity" "current" {}
+data "aws_availability_zones" "available" {}
+
+# KMS Key for EKS cluster encryption
+resource "aws_kms_key" "eks" {
+  description             = "EKS Secret Encryption Key"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = merge(var.tags, {
+    Name = "${var.cluster_name}-eks-encryption-key"
+  })
+}
+
+resource "aws_kms_alias" "eks" {
+  name          = "alias/${var.cluster_name}-eks"
+  target_key_id = aws_kms_key.eks.key_id
+}
+
+# VPC Module
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 6.0"
+
+  name = "${var.cluster_name}-vpc"
+  cidr = var.vpc_cidr
+
+  azs             = var.azs
+  private_subnets = var.private_subnets
+  public_subnets  = var.public_subnets
+
+  enable_nat_gateway   = true
+  enable_vpn_gateway   = false
   enable_dns_hostnames = true
   enable_dns_support   = true
 
-  tags = {
-    Name = "cis-test-vpc"
+  # Enable VPC Flow Logs for security monitoring
+  enable_flow_log                      = true
+  create_flow_log_cloudwatch_iam_role  = true
+  create_flow_log_cloudwatch_log_group = true
+
+  public_subnet_tags = {
+    "kubernetes.io/role/elb" = "1"
   }
+
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+
+  tags = var.tags
 }
 
-# 인터넷 게이트웨이
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
+# EKS Module
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 21.0"
 
-  tags = {
-    Name = "cis-test-igw"
+  cluster_name    = var.cluster_name
+  cluster_version = var.cluster_version
+
+  # Cluster endpoint configuration - Well-Architected security practice
+  cluster_endpoint_public_access  = false
+  cluster_endpoint_private_access = true
+
+  # Enable cluster logging for all log types - Well-Architected observability
+  cluster_enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+  # Cluster encryption configuration
+  cluster_encryption_config = {
+    provider_key_arn = aws_kms_key.eks.arn
+    resources        = ["secrets"]
   }
+
+  vpc_id                   = module.vpc.vpc_id
+  subnet_ids               = module.vpc.private_subnets
+  control_plane_subnet_ids = module.vpc.private_subnets
+
+  # EKS Managed Node Groups
+  eks_managed_node_groups = {
+    for name, config in var.node_groups : name => {
+      instance_types = config.instance_types
+      capacity_type  = config.capacity_type
+
+      min_size     = config.min_size
+      max_size     = config.max_size
+      desired_size = config.desired_size
+
+      # Use latest EKS optimized AMI
+      ami_type = "AL2023_x86_64_STANDARD"
+
+      # Enable IMDSv2 for security
+      metadata_options = {
+        http_endpoint               = "enabled"
+        http_tokens                 = "required"
+        http_put_response_hop_limit = 2
+        instance_metadata_tags      = "disabled"
+      }
+
+      # EBS encryption
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size           = 50
+            volume_type           = "gp3"
+            iops                  = 3000
+            throughput            = 150
+            encrypted             = true
+            delete_on_termination = true
+          }
+        }
+      }
+
+      # Security group rules
+      create_security_group = true
+      security_group_rules = {
+        ingress_cluster_443 = {
+          description                   = "Cluster API to node groups"
+          protocol                      = "tcp"
+          from_port                     = 443
+          to_port                       = 443
+          type                          = "ingress"
+          source_cluster_security_group = true
+        }
+        ingress_cluster_kubelet = {
+          description                   = "Cluster API to node kubelets"
+          protocol                      = "tcp"
+          from_port                     = 10250
+          to_port                       = 10250
+          type                          = "ingress"
+          source_cluster_security_group = true
+        }
+        ingress_self_coredns_tcp = {
+          description = "Node to node CoreDNS"
+          protocol    = "tcp"
+          from_port   = 53
+          to_port     = 53
+          type        = "ingress"
+          self        = true
+        }
+        ingress_self_coredns_udp = {
+          description = "Node to node CoreDNS UDP"
+          protocol    = "udp"
+          from_port   = 53
+          to_port     = 53
+          type        = "ingress"
+          self        = true
+        }
+        egress_all = {
+          description = "Node all egress"
+          protocol    = "-1"
+          from_port   = 0
+          to_port     = 0
+          type        = "egress"
+          cidr_blocks = ["0.0.0.0/0"]
+        }
+      }
+
+      tags = merge(var.tags, {
+        Name = "${var.cluster_name}-${name}-node-group"
+      })
+    }
+  }
+
+  # Cluster access entry
+  access_entries = {
+    cluster_creator = {
+      principal_arn = data.aws_caller_identity.current.arn
+      policy_associations = {
+        admin = {
+          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          access_scope = {
+            type = "cluster"
+          }
+        }
+      }
+    }
+  }
+
+  tags = var.tags
+}
+# E
+KS Addons for Well-Architected Framework
+module "eks_addons" {
+  source = "./modules/eks-addons"
+
+  cluster_name                = module.eks.cluster_name
+  cluster_endpoint            = module.eks.cluster_endpoint
+  cluster_version             = module.eks.cluster_version
+  oidc_provider_arn          = module.eks.oidc_provider_arn
+  node_security_group_id     = module.eks.node_security_group_id
+  
+  tags = var.tags
+
+  depends_on = [module.eks]
 }
 
-# 퍼블릭 서브넷
-resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = true
+# CloudWatch Log Groups for EKS
+resource "aws_cloudwatch_log_group" "eks_cluster" {
+  name              = "/aws/eks/${var.cluster_name}/cluster"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.eks.arn
 
-  tags = {
-    Name = "cis-test-public-subnet"
-  }
+  tags = merge(var.tags, {
+    Name = "${var.cluster_name}-cluster-logs"
+  })
 }
 
-# 라우팅 테이블
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-
-  tags = {
-    Name = "cis-test-public-rt"
-  }
+# Security Group for additional rules
+resource "aws_security_group_rule" "cluster_ingress_workstation_https" {
+  description       = "Allow workstation to communicate with the cluster API Server"
+  type              = "ingress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = [module.vpc.vpc_cidr_block]
+  security_group_id = module.eks.cluster_security_group_id
 }
 
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
-}
+# IAM role for EKS service account (IRSA)
+resource "aws_iam_role" "eks_service_account" {
+  name = "${var.cluster_name}-service-account-role"
 
-# CIS 정책 위반을 위한 보안 그룹 (SSH/RDP 포트 개방)
-resource "aws_security_group" "vulnerable_sg" {
-  name        = "cis-test-vulnerable-sg"
-  description = "CIS test - vulnerable security group"
-  vpc_id      = aws_vpc.main.id
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Effect = "Allow"
+        Principal = {
+          Federated = module.eks.oidc_provider_arn
+        }
+        Condition = {
+          StringEquals = {
+            "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
+            "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:aud" = "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
 
-  # SSH 포트를 모든 IP에 개방 (CIS 위반)
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # RDP 포트를 모든 IP에 개방 (CIS 위반)
-  ingress {
-    from_port   = 3389
-    to_port     = 3389
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "cis-test-vulnerable-sg"
-  }
-}
-
-# 암호화되지 않은 EBS 볼륨 (CIS 위반)
-resource "aws_ebs_volume" "unencrypted" {
-  availability_zone = data.aws_availability_zones.available.names[0]
-  size              = 10
-  encrypted         = false  # CIS 위반
-
-  tags = {
-    Name = "cis-test-unencrypted-volume"
-  }
-}
-
-# S3 버킷 (보안 설정 누락으로 CIS 위반)
-resource "aws_s3_bucket" "test_bucket" {
-  bucket = "cis-test-bucket-${random_id.bucket_suffix.hex}"
-
-  tags = {
-    Name = "cis-test-bucket"
-  }
-}
-
-# S3 버킷 퍼블릭 액세스 차단 설정 누락 (CIS 위반)
-# aws_s3_bucket_public_access_block 리소스가 없음
-
-# CloudTrail 설정 누락 (CIS 위반)
-# aws_cloudtrail 리소스가 없음
-
-# 랜덤 ID 생성
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
-}
-
-# 데이터 소스
-data "aws_availability_zones" "available" {
-  state = "available"
+  tags = var.tags
 }
